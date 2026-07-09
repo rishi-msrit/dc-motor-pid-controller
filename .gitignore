@@ -1,0 +1,22 @@
+# Arduino / PlatformIO
+*.hex
+*.elf
+*.bin
+build/
+.pio/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+*.code-workspace
