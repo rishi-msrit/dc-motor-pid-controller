@@ -1,175 +1,128 @@
-# DC Motor Position & Speed Controller — STM32 + Quadrature Encoder + PID
+# DC Motor Controller with Quadrature Encoder and PID
 
-A closed-loop DC motor control system implemented on the **STM32F103C8T6** (Blue Pill) microcontroller, using quadrature encoder feedback and a PID algorithm running at a **1 ms sample period** via hardware Timer4 interrupt. The system independently controls position for two motors through an MX1508 H-bridge, with a live serial interface for real-time parameter adjustment.
+Closed-loop position controller for two DC motors using an STM32F103C8 (Blue Pill). Quadrature encoder feedback is decoded via interrupt and a PID loop runs every 1ms using a hardware timer. Motor drive is through an MX1508 H-bridge.
 
-An Arduino Uno reference implementation is included in `firmware/arduino_reference/` — a single-motor speed controller used during the initial validation phase before porting to STM32.
-
----
-
-## System Overview
-
-```
- Serial Target Position     ┌──────────────────────────────────┐
- (UART / Potentiometer) ──► │  STM32F103C8  (72 MHz Cortex-M3) │
-                            │                                    │
-                            │  • Timer4 ISR @ 1 ms              │
-                            │  • PID0 (Motor A) Kp=40 Ki=10 Kd=1│
-                            │  • PID1 (Motor B) Kp=40 Ki=10 Kd=1│
-                            └──────┬────────────────────────────┘
-                                   │ PWM (PA0–PA3)
-                                   ▼
-                           ┌────────────────┐
-                           │  MX1508 H-bridge│
-                           └───┬────────┬───┘
-                               │        │
-                          Motor A    Motor B
-                               │        │
-                   Quadrature Encoder (A+B phases)
-                          PB0/PB1   PB3/PB4
-```
+Also includes an Arduino Uno single-motor speed controller in `firmware/arduino_reference/` that was used for initial testing.
 
 ---
 
-## Measured Performance
+## Performance
 
 | Metric | Value |
 |---|---|
-| Position step (0 → 500 encoder counts) — settling time | **~118 ms** |
-| Steady-state position error | **< 3 encoder counts** (< 0.5°) |
-| Overshoot on step input | **~12 %** |
-| Rise time (10%→90%) | **~72 ms** |
-| Disturbance rejection (external load applied) | Auto-restores to target in < 200 ms |
-| Control loop sample period | **1 ms** (deterministic, hardware Timer4) |
-| Maximum controllable speed | ~300 RPM (encoder resolution limited) |
-
-PID gains were tuned starting from open-loop step response characterisation, then refined iteratively over serial using the `stm32_pid_tuning` firmware variant. The encoder ISR uses a branch-free **4-state lookup table** for quadrature decoding — minimising interrupt latency at high motor speeds.
+| Step input (0 to 500 counts) settling time | ~118 ms |
+| Steady-state position error | < 3 encoder counts |
+| Overshoot | ~12% |
+| Rise time (10% to 90%) | ~72 ms |
+| Disturbance rejection | restores position in < 200 ms |
+| PID sample period | 1 ms (Timer4 hardware interrupt) |
 
 ---
 
 ## Hardware
 
-| Component | Part | Notes |
-|---|---|---|
-| MCU | STM32F103C8T6 (Blue Pill) | 72 MHz ARM Cortex-M3, 20 KB SRAM |
-| H-bridge | MX1508 | Dual-channel, L298N/L294D compatible |
-| Motors | Mabutchi 5 V geared DC motor with encoder | Quadrature A+B output |
-| Communication | UART1 at 115200 baud | Serial monitor or HC-05 Bluetooth |
+| Part | Detail |
+|---|---|
+| MCU | STM32F103C8T6, 72 MHz Cortex-M3 |
+| H-bridge | MX1508 (dual channel, L298N compatible) |
+| Motors | Mabutchi 5V DC motor with quadrature encoder |
+| Serial | UART1 at 115200 baud (PA9/PA10) |
 
-### Circuit Diagram
+### Wiring
+
+| Signal | Pin |
+|---|---|
+| Motor A forward PWM | PA0 |
+| Motor A reverse PWM | PA1 |
+| Motor B forward PWM | PA2 |
+| Motor B reverse PWM | PA3 |
+| Encoder A1 | PB0 |
+| Encoder B1 | PB1 |
+| Encoder A2 | PB3 |
+| Encoder B2 | PB4 |
+| UART TX | PA9 |
+| UART RX | PA10 |
+| LED | PC13 |
+
+### Circuit
 
 ![Circuit Diagram](schematics/circuit_diagram.png)
 
-> Full simulation schematic (`schematics/motor_controller_schematic.pdsprj`) is included — open with Proteus Design Suite 8.
-
-### Pin Assignment
-
-| Signal | STM32 Pin |
-|---|---|
-| Motor A — PWM forward | PA0 |
-| Motor A — PWM reverse | PA1 |
-| Motor B — PWM forward | PA2 |
-| Motor B — PWM reverse | PA3 |
-| Encoder A1 (Motor A) | PB0 |
-| Encoder B1 (Motor A) | PB1 |
-| Encoder A2 (Motor B) | PB3 |
-| Encoder B2 (Motor B) | PB4 |
-| UART TX | PA9 |
-| UART RX | PA10 |
-| Status LED | PC13 |
+Proteus schematic: `schematics/motor_controller_schematic.pdsprj`
 
 ---
 
 ## Firmware
 
-### `firmware/stm32_motor_control/dc_motor_pid_stm32.ino` — Primary
+### stm32_motor_control/dc_motor_pid_stm32.ino
 
-**Quadrature decoder via lookup table (ISR):**
+Main firmware. Quadrature decoding uses a 16-element lookup table inside the ISR (no branch instructions):
 ```c
 int enc[] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
-// 4-bit index = {prev_B, prev_A, curr_B, curr_A}
-// Zero branch instructions — maximum ISR throughput
+```
+4-bit index = {prev_B, prev_A, curr_B, curr_A}. Fast and deterministic.
+
+PID runs in `tick()` which is called by Timer4 every 1ms:
+```
+Kp = 40   Ki = 10   Kd = 1
+Output limits: -255 to 255
 ```
 
-**Hardware timer interrupt (1 ms):**
-Timer4 fires `tick()` every 1 ms, which calls `PID0.Compute()` and `PID1.Compute()` synchronously — no jitter, no delay().
+### stm32_pid_tuning/dc_motor_pid_tuning.ino
 
-**PID configuration:**
-```
-Kp = 40.0  |  Ki = 10.0  |  Kd = 1.0
-Sample time: 1 ms  |  Output limits: [-255, 255]  |  Direction: DIRECT
-```
+Same as above but with verbose serial logging. PID gains and setpoints can be changed live over UART without reflashing:
 
-### `firmware/stm32_pid_tuning/dc_motor_pid_tuning.ino` — Tuning Mode
-
-All gains and setpoints adjustable live over UART (no re-flash needed):
-
-| Command | Effect |
+| Command | Action |
 |---|---|
-| `0 NNN` | Set Motor A target position (NNN ÷ 10) |
-| `1 NNN` | Set Motor B target position |
-| `p NNN` | Set Kp for both motors |
-| `i NNN` | Set Ki for both motors |
-| `d NNN` | Set Kd for both motors |
-| `s` | Dump all state (position, gains, output) to serial |
-| `b` | Toggle continuous debug logging |
+| `0 NNN` | Motor A target (NNN/10) |
+| `1 NNN` | Motor B target |
+| `p NNN` | Set Kp |
+| `i NNN` | Set Ki |
+| `d NNN` | Set Kd |
+| `s` | Print current state |
+| `b` | Toggle debug output |
 
-### `firmware/arduino_reference/dc_motor_pid_arduino.ino` — Reference
+### arduino_reference/dc_motor_pid_arduino.ino
 
-Single-motor **speed controller** on Arduino Uno. Used for initial PID concept validation.
+Single-motor speed controller on Arduino Uno.
 
 | Parameter | Value |
 |---|---|
-| Encoder | 234.3 PPR, single-channel (rising edge count) |
-| Setpoint source | Potentiometer → 0–280 RPM |
+| Encoder | 234.3 PPR, single-channel |
+| Speed range | 0 to 280 RPM via potentiometer |
 | Sample period | 100 ms |
 | PID gains | Kp=0.5, Ki=5, Kd=0.002 |
-| Display | 16×2 I2C LCD at 0x27 |
-| PID form | Positional difference equation |
+| Display | 16x2 I2C LCD at 0x27 |
 
 ---
 
-## Repository Structure
+## Files
 
 ```
 dc-motor-pid-controller/
 ├── firmware/
-│   ├── stm32_motor_control/
-│   │   └── dc_motor_pid_stm32.ino     # Primary STM32 dual-motor firmware
-│   ├── stm32_pid_tuning/
-│   │   └── dc_motor_pid_tuning.ino    # PID characterisation / tuning mode
-│   └── arduino_reference/
-│       └── dc_motor_pid_arduino.ino   # Single-motor speed control (Arduino Uno)
+│   ├── stm32_motor_control/       Main STM32 firmware
+│   ├── stm32_pid_tuning/          Tuning/characterization firmware
+│   └── arduino_reference/         Arduino Uno single-motor speed control
 ├── schematics/
-│   ├── circuit_diagram.png            # System circuit diagram
-│   └── motor_controller_schematic.pdsprj  # Proteus simulation schematic
-├── docs/
-│   ├── pid_controller_reference.pdf   # PID design reference
-│   └── servoclock_util.py             # Python timing utility
-└── README.md
+│   ├── circuit_diagram.png
+│   └── motor_controller_schematic.pdsprj
+└── docs/
+    ├── pid_controller_reference.pdf
+    └── servoclock_util.py
 ```
 
 ---
 
-## Getting Started
+## Setup
 
-### STM32 (Primary)
-1. Install **STM32duino** board support in Arduino IDE.
-2. Install **PID_v1** library via Library Manager.
-3. Open `firmware/stm32_motor_control/dc_motor_pid_stm32.ino`.
-4. Board: **Generic STM32F103C8**, upload via ST-Link or USB bootloader.
-5. Serial monitor: 115200 baud on UART1 (PA9/PA10).
+**STM32:**
+1. Install STM32duino board support in Arduino IDE
+2. Install PID_v1 library
+3. Upload `dc_motor_pid_stm32.ino`, board: Generic STM32F103C8
+4. Open serial monitor at 115200 baud on PA9/PA10
 
-### Arduino Uno (Reference)
-1. Install `LiquidCrystal_I2C` library.
-2. Open `firmware/arduino_reference/dc_motor_pid_arduino.ino`.
-3. Upload → open Serial Plotter at 112500 baud.
-
----
-
-## Dependencies
-
-```
-STM32duino board package
-PID_v1 library (Brett Beauregard)
-LiquidCrystal_I2C (Arduino Uno variant only)
-```
+**Arduino:**
+1. Install LiquidCrystal_I2C library
+2. Upload `dc_motor_pid_arduino.ino`
+3. Open Serial Plotter at 112500 baud
